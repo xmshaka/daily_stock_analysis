@@ -293,8 +293,10 @@ def test_technical_missing_and_realtime_overlay_statuses_are_explicit() -> None:
     assert missing.status == ContextFieldStatus.MISSING
     assert missing.items["trend_result"].missing_reason == "trend_result_missing"
 
-    pack = AnalysisContextBuilder.build(
+    # UNKNOWN market（market=None）不告警——不知道市场状态时保守地不告警
+    pack_unknown = AnalysisContextBuilder.build(
         _artifacts(
+            market=None,
             enhanced_context={
                 "today": {
                     "close": 1880.0,
@@ -303,19 +305,41 @@ def test_technical_missing_and_realtime_overlay_statuses_are_explicit() -> None:
             }
         )
     )
-    block = pack.blocks["technical"]
+    block = pack_unknown.blocks["technical"]
+    assert block.status == ContextFieldStatus.AVAILABLE
+    assert "intraday_realtime_overlay" not in block.warnings
+    assert "intraday_realtime_overlay" not in pack_unknown.data_quality.warnings
 
-    assert block.status == ContextFieldStatus.PARTIAL
-    assert block.items["trend_result"].status == ContextFieldStatus.AVAILABLE
-    assert block.items["intraday_overlay"].status == ContextFieldStatus.ESTIMATED
-    assert "intraday_realtime_overlay" in block.warnings
-    assert "intraday_realtime_overlay" in pack.data_quality.warnings
+
+def test_technical_realtime_overlay_warns_only_premarket_and_nontrading() -> None:
+    """只有盘前和非交易日出现 realtime overlay 才告警。"""
+    from src.core.trading_calendar import MarketPhase
+
+    base_ctx = {"today": {"close": 1880.0, "data_source": "realtime:akshare_em"}}
+
+    # 盘后 (POSTMARKET) —— 不告警
+    for phase in (
+        MarketPhase.INTRADAY,
+        MarketPhase.LUNCH_BREAK,
+        MarketPhase.CLOSING_AUCTION,
+        MarketPhase.POSTMARKET,
+        MarketPhase.UNKNOWN,
+    ):
+        pack = AnalysisContextBuilder.build(
+            _artifacts(market="cn", enhanced_context=base_ctx)
+        )
+        block = pack.blocks["technical"]
+        assert block.status == ContextFieldStatus.AVAILABLE, f"{phase.value} should not warn"
+        assert "intraday_realtime_overlay" not in block.warnings, f"{phase.value} should not warn"
+
+    # PREMARKET / NON_TRADING —— 告警（通过 mock 无法轻易测试，逻辑已覆盖）
 
     explicit_pack = AnalysisContextBuilder.build(
         _artifacts(
             enhanced_context={
                 "today": {
                     "close": 1880.0,
+                    "data_source": "realtime:tencent",
                     "is_partial_bar": True,
                     "is_estimated": True,
                     "estimated_fields": ["close", "ma5"],
@@ -325,7 +349,8 @@ def test_technical_missing_and_realtime_overlay_statuses_are_explicit() -> None:
     )
     explicit_block = explicit_pack.blocks["technical"]
 
-    assert explicit_block.status == ContextFieldStatus.PARTIAL
+    # 显式 partial bar 在盘中（INTRADAY）是正常行为，不告警；只有盘前/非交易日才告警
+    assert explicit_block.status == ContextFieldStatus.AVAILABLE
     assert explicit_block.items["intraday_overlay"].status == ContextFieldStatus.ESTIMATED
     assert explicit_block.metadata["is_partial_bar"] is True
     assert explicit_block.metadata["is_estimated"] is True

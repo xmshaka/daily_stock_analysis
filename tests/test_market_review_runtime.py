@@ -32,8 +32,6 @@ class TestMarketReviewRuntimeCompatibility(unittest.TestCase):
             brave_api_keys=None,
             serpapi_api_keys=None,
             minimax_api_keys=None,
-            searxng_base_urls=None,
-            searxng_public_instances_enabled=True,
             news_max_age_days=3,
             news_strategy_profile="short",
             has_search_capability_enabled=lambda: False,

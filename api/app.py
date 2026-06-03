@@ -126,6 +126,7 @@ from api.v1 import api_v1_router
 from api.middlewares.auth import add_auth_middleware
 from api.middlewares.error_handler import add_error_handlers
 from api.v1.schemas.common import HealthResponse
+from api.v1.endpoints.health import set_version_info
 from src.data.stock_index_loader import find_existing_stock_index_path
 from src.services.system_config_service import SystemConfigService
 from src.services.stock_index_remote_service import (
@@ -133,6 +134,29 @@ from src.services.stock_index_remote_service import (
     refresh_remote_stock_index_cache,
     settings_from_config,
 )
+
+
+def _get_git_commit_hash() -> str | None:
+    """读取当前代码的 Git commit hash（short）。"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _get_build_time() -> str:
+    """返回当前进程启动时间作为构建时间。"""
+    return datetime.now().isoformat()
 
 
 _STOCK_INDEX_FILENAME = "stocks.index.json"
@@ -249,9 +273,18 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     add_auth_middleware(app)
     
     # ============================================================
+    # 注入版本信息（供 /api/v1/version 返回）
+    # ============================================================
+    set_version_info(
+        version=getattr(app, "version", "1.0.0"),
+        commit=_get_git_commit_hash(),
+        build_time=_get_build_time(),
+    )
+
+    # ============================================================
     # 注册路由
     # ============================================================
-    
+
     app.include_router(api_v1_router)
     add_error_handlers(app)
     

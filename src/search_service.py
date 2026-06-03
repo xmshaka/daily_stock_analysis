@@ -6,16 +6,19 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
+2. 支持 Bocha、Tavily、Brave、SerpAPI、AnySearch 多种搜索引擎
 3. 多 Key 负载均衡和故障转移
 4. 搜索结果缓存和格式化
 """
 
 import logging
+import os
 import re
+import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -1695,69 +1698,324 @@ class BraveSearchProvider(BaseSearchProvider):
         )
 
 
-class SearXNGSearchProvider(BaseSearchProvider):
+class AnySearchProvider(BaseSearchProvider):
     """
-    SearXNG search engine (self-hosted, no quota).
-
-    Self-hosted instances are used when explicitly configured.
-    Otherwise, the provider can lazily discover public instances from
-    searx.space and rotate across them with per-request failover.
+    AnySearch — Chinese A-share vertical search + general web search.
+    Uses the bundled anysearch_cli.py subprocess (JSON-RPC 2.0 over HTTP).
+    Supports anonymous access (lower rate limits) + optional API key.
     """
 
-    PUBLIC_INSTANCES_URL = "https://searx.space/data/instances.json"
-    PUBLIC_INSTANCES_CACHE_TTL_SECONDS = 3600
-    PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS = 60
-    PUBLIC_INSTANCES_POOL_LIMIT = 20
-    PUBLIC_INSTANCES_MAX_ATTEMPTS = 3
-    PUBLIC_INSTANCES_TIMEOUT_SECONDS = 5
-    SELF_HOSTED_TIMEOUT_SECONDS = 10
+    # Resolve CLI path relative to this repo / workspace
+    _CLI_CANDIDATES = [
+        # 1) bundled inside the project
+        os.path.join(os.path.dirname(__file__), '..', 'skills', 'anysearch', 'scripts', 'anysearch_cli.py'),
+        # 2) OpenClaw workspace skill
+        os.path.expanduser('~/.openclaw/workspace/skills/anysearch/scripts/anysearch_cli.py'),
+    ]
 
-    _public_instances_cache: Optional[Tuple[float, List[str]]] = None
-    _public_instances_stale_retry_after: float = 0.0
-    _public_instances_lock = threading.Lock()
+    # A-share code pattern: 6 consecutive digits at start or standalone
+    _ASTOCK_CODE_RE = re.compile(r'\b(\d{6})\b')
 
-    def __init__(self, base_urls: Optional[List[str]] = None, *, use_public_instances: bool = False):
-        normalized_base_urls = [url.rstrip("/") for url in (base_urls or []) if url.strip()]
-        super().__init__(normalized_base_urls, "SearXNG")
-        self._base_urls = normalized_base_urls
-        self._use_public_instances = bool(use_public_instances and not self._base_urls)
-        self._cursor = 0
-        self._cursor_lock = threading.Lock()
+    # ---- shared quota/breaker state (class-level, thread-safe) ----
+    _QUOTA_LOCK = threading.Lock()
+    _QUOTA_DATE: Optional[str] = None  # YYYY-MM-DD
+    _QUOTA_CALLS: int = 0
+    _QUOTA_LIMIT_OVERRIDE: Optional[int] = None  # last seen limit (for logging)
+    _BREAKER_FAILS: int = 0
+    _BREAKER_OPENED_AT: float = 0.0
+    _BREAKER_THRESHOLD: int = 3
+    _BREAKER_COOLDOWN_SEC: int = 60
+
+    # process-wide response cache (query|domain|sub_domain|days|max_results -> (timestamp, SearchResponse))
+    _CACHE_LOCK = threading.Lock()
+    _CACHE: "OrderedDict[str, Tuple[float, SearchResponse]]" = OrderedDict()
+    _CACHE_MAX: int = 256
+    _CACHE_TTL_SEC: int = 900  # 15 minutes
+
+    def __init__(
+        self,
+        api_keys: Optional[List[str]] = None,
+        cli_path: Optional[str] = None,
+        daily_limit: Optional[int] = None,
+        cache_ttl_sec: Optional[int] = None,
+    ):
+        # Allow anonymous (empty key list) — is_available overridden below
+        keys = api_keys or []
+        super().__init__(keys, "AnySearch")
+        self._cli_path = cli_path or self._resolve_cli()
+        # Resolve daily limit: explicit > env > default(200 anonymous / 2000 with key)
+        env_limit = os.getenv("ANYSEARCH_DAILY_LIMIT", "").strip()
+        if daily_limit is not None:
+            self._daily_limit = max(0, int(daily_limit))
+        elif env_limit:
+            try:
+                self._daily_limit = max(0, int(env_limit))
+            except ValueError:
+                self._daily_limit = 200
+        else:
+            self._daily_limit = 2000 if keys else 200
+        # Cache TTL
+        env_ttl = os.getenv("ANYSEARCH_CACHE_TTL_SEC", "").strip()
+        if cache_ttl_sec is not None:
+            type(self)._CACHE_TTL_SEC = max(0, int(cache_ttl_sec))
+        elif env_ttl:
+            try:
+                type(self)._CACHE_TTL_SEC = max(0, int(env_ttl))
+            except ValueError:
+                pass
+        type(self)._QUOTA_LIMIT_OVERRIDE = self._daily_limit
 
     @property
     def is_available(self) -> bool:
-        return bool(self._base_urls) or self._use_public_instances
+        """Available when CLI is found (anonymous access supported)."""
+        return bool(self._cli_path)
+
+    # ---- quota helpers ----
 
     @classmethod
-    def reset_public_instance_cache(cls) -> None:
-        """Reset the shared searx.space cache (used by tests)."""
-        with cls._public_instances_lock:
-            cls._public_instances_cache = None
-            cls._public_instances_stale_retry_after = 0.0
+    def _quota_check_and_increment(cls, limit: int) -> Tuple[bool, int]:
+        """Returns (allowed, current_calls_after_check). Thread-safe."""
+        today = date.today().isoformat()
+        with cls._QUOTA_LOCK:
+            if cls._QUOTA_DATE != today:
+                cls._QUOTA_DATE = today
+                cls._QUOTA_CALLS = 0
+            if limit > 0 and cls._QUOTA_CALLS >= limit:
+                return False, cls._QUOTA_CALLS
+            cls._QUOTA_CALLS += 1
+            return True, cls._QUOTA_CALLS
 
-    @staticmethod
-    def _parse_http_error(response) -> str:
-        """Parse HTTP error details for easier diagnostics."""
+    @classmethod
+    def _breaker_is_open(cls) -> Tuple[bool, float]:
+        """Returns (open, remaining_cooldown_seconds)."""
+        with cls._QUOTA_LOCK:
+            if cls._BREAKER_OPENED_AT == 0.0:
+                return False, 0.0
+            elapsed = time.time() - cls._BREAKER_OPENED_AT
+            remaining = cls._BREAKER_COOLDOWN_SEC - elapsed
+            if remaining <= 0:
+                # cooldown expired, reset
+                cls._BREAKER_OPENED_AT = 0.0
+                cls._BREAKER_FAILS = 0
+                return False, 0.0
+            return True, remaining
+
+    @classmethod
+    def _breaker_record_failure(cls) -> None:
+        with cls._QUOTA_LOCK:
+            cls._BREAKER_FAILS += 1
+            if cls._BREAKER_FAILS >= cls._BREAKER_THRESHOLD:
+                cls._BREAKER_OPENED_AT = time.time()
+                logger.warning(
+                    "[AnySearch] 熜断器触发：连续 %s 次失败，暂停 %s 秒",
+                    cls._BREAKER_FAILS,
+                    cls._BREAKER_COOLDOWN_SEC,
+                )
+
+    @classmethod
+    def _breaker_record_success(cls) -> None:
+        with cls._QUOTA_LOCK:
+            cls._BREAKER_FAILS = 0
+            cls._BREAKER_OPENED_AT = 0.0
+
+    # ---- cache helpers ----
+
+    @classmethod
+    def _cache_key(cls, query: str, domain: Optional[str], sub_domain: Optional[str], zone: Optional[str], freshness: Optional[str], max_results: int) -> str:
+        return f"{query}|{domain or ''}|{sub_domain or ''}|{zone or ''}|{freshness or ''}|{max_results}"
+
+    @classmethod
+    def _cache_get(cls, key: str) -> Optional[SearchResponse]:
+        if cls._CACHE_TTL_SEC <= 0:
+            return None
+        now = time.time()
+        with cls._CACHE_LOCK:
+            entry = cls._CACHE.get(key)
+            if entry is None:
+                return None
+            ts, resp = entry
+            if now - ts > cls._CACHE_TTL_SEC:
+                cls._CACHE.pop(key, None)
+                return None
+            # mark as MRU
+            cls._CACHE.move_to_end(key)
+            return resp
+
+    @classmethod
+    def _cache_put(cls, key: str, resp: SearchResponse) -> None:
+        if cls._CACHE_TTL_SEC <= 0:
+            return
+        with cls._CACHE_LOCK:
+            cls._CACHE[key] = (time.time(), resp)
+            cls._CACHE.move_to_end(key)
+            while len(cls._CACHE) > cls._CACHE_MAX:
+                cls._CACHE.popitem(last=False)
+
+    # ---- override base _execute_search to bypass the api_key gate ----
+
+    def _execute_search(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        days: int = 7,
+        api_key: Optional[str] = None,
+        **search_kwargs: Any,
+    ) -> SearchResponse:
+        api_key = api_key or self._get_next_key() or ""  # empty = anonymous
+        start_time = time.time()
+
+        # 1) Cache lookup (key includes routing dimensions so vertical vs general don't collide)
+        is_cn_stock, clean_query = self._detect_cn_stock(query)
+        freshness = self._days_to_freshness(days)
+        zone = "cn" if is_cn_stock else None
+        ckey = self._cache_key(clean_query, None, None, zone, freshness, max_results)
+        cached = self._cache_get(ckey)
+        if cached is not None:
+            logger.info(
+                "[%s] 缓存命中 '%s' （返回 %d 条结果）",
+                self._name, query, len(cached.results),
+            )
+            # Return a shallow copy to avoid mutation across callers
+            return SearchResponse(
+                query=query,
+                results=list(cached.results),
+                provider=self._name,
+                success=cached.success,
+                error_message=cached.error_message,
+                search_time=0.0,
+            )
+
+        # 2) Breaker check
+        open_, remaining = self._breaker_is_open()
+        if open_:
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False,
+                error_message=f"AnySearch 熜断中，{remaining:.0f}s 后重试",
+            )
+
+        # 3) Daily quota check
+        allowed, current = self._quota_check_and_increment(self._daily_limit)
+        if not allowed:
+            logger.warning(
+                "[%s] 超过每日调用上限 %d，本日不再调用",
+                self._name, self._daily_limit,
+            )
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False,
+                error_message=f"AnySearch 每日调用额度 {self._daily_limit} 已用完，请配置 API Key 或明日重试",
+            )
+
+        # 4) Execute
         try:
-            raw_content_type = response.headers.get("content-type", "")
-            content_type = raw_content_type if isinstance(raw_content_type, str) else ""
-            if "json" in content_type:
-                error_data = response.json()
-                if isinstance(error_data, dict):
-                    message = error_data.get("error") or error_data.get("message")
-                    if message:
-                        return str(message)
-                return str(error_data)
-            raw_text = getattr(response, "text", "")
-            body = raw_text.strip() if isinstance(raw_text, str) else ""
-            return body[:200] if body else f"HTTP {response.status_code}"
-        except Exception:
-            raw_text = getattr(response, "text", "")
-            body = raw_text if isinstance(raw_text, str) else ""
-            return f"HTTP {response.status_code}: {body[:200]}"
+            response = self._do_search(query, api_key, max_results, days=days)
+            response.search_time = time.time() - start_time
+            if response.success:
+                if api_key:
+                    self._record_success(api_key)
+                self._breaker_record_success()
+                self._cache_put(ckey, response)
+                logger.info(
+                    "[%s] 搜索 '%s' 成功，返回 %d 条结果，耗时 %.2fs (今日已用 %d/%d)",
+                    self._name, query, len(response.results), response.search_time,
+                    current, self._daily_limit,
+                )
+            else:
+                if api_key:
+                    self._record_error(api_key)
+                self._breaker_record_failure()
+            return response
+        except Exception as e:
+            if api_key:
+                self._record_error(api_key)
+            self._breaker_record_failure()
+            elapsed = time.time() - start_time
+            logger.error("[%s] 搜索 '%s' 异常: %s", self._name, query, e)
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False, error_message=str(e), search_time=elapsed,
+            )
+
+    # ---- core implementation ----
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,  # may be empty for anonymous
+        max_results: int,
+        days: int = 7,
+    ) -> SearchResponse:
+        if not self._cli_path:
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False, error_message="AnySearch CLI 未找到",
+            )
+
+        # Build freshness from days
+        freshness = self._days_to_freshness(days)
+
+        # Detect A-share code in query and decide strategy
+        is_cn_stock, clean_query = self._detect_cn_stock(query)
+
+        # Build subprocess args
+        # NOTE: Do NOT use --domain finance --sub_domain finance.cn_stock for news queries.
+        # That vertical domain returns daily OHLCV JSON rows, not news articles.
+        # Use general search with --zone cn + --freshness instead.
+        cmd = ["python3", self._cli_path, "search", clean_query]
+        if is_cn_stock:
+            cmd += ["--zone", "cn"]
+        if freshness:
+            cmd += ["--freshness", freshness]
+        cmd += ["--max_results", str(min(max_results * 3, 30))]
+
+        env = os.environ.copy()
+        if api_key:
+            env["ANYSEARCH_API_KEY"] = api_key
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False, error_message="AnySearch CLI 超时",
+            )
+        except Exception as e:
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False, error_message=f"AnySearch CLI 执行失败: {e}",
+            )
+
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()[:300]
+            return SearchResponse(
+                query=query, results=[], provider=self._name,
+                success=False, error_message=f"AnySearch CLI 错误 (rc={proc.returncode}): {stderr}",
+            )
+
+        return self._parse_cli_output(query, proc.stdout, max_results)
+
+    # ---- helpers ----
+
+    @classmethod
+    def _resolve_cli(cls) -> Optional[str]:
+        # Allow tests / restricted environments to opt out of auto-registration.
+        if os.getenv("ANYSEARCH_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+            return None
+        for p in cls._CLI_CANDIDATES:
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+        return None
 
     @staticmethod
-    def _time_range(days: int) -> str:
+    def _days_to_freshness(days: int) -> str:
         if days <= 1:
             return "day"
         if days <= 7:
@@ -1767,330 +2025,178 @@ class SearXNGSearchProvider(BaseSearchProvider):
         return "year"
 
     @classmethod
-    def _search_latency_seconds(cls, instance_data: Dict[str, Any]) -> float:
-        timing = (instance_data.get("timing") or {}).get("search") or {}
-        all_timing = timing.get("all")
-        if isinstance(all_timing, dict):
-            for key in ("mean", "median"):
-                value = all_timing.get(key)
-                if isinstance(value, (int, float)):
-                    return float(value)
-        return float("inf")
+    def _detect_cn_stock(cls, query: str) -> Tuple[bool, str]:
+        """
+        Detect A-share stock context in query.
+        Returns (is_cn_stock, clean_query).
+        Strategy: if query contains a 6-digit code, strip it for cn_stock
+        vertical (codes trigger行情 not新闻), keep only company name + keywords.
+        """
+        match = cls._ASTOCK_CODE_RE.search(query)
+        if not match:
+            return False, query
+        code = match.group(1)
+        # Only treat as A-share if code starts with typical prefixes (0/3/6/8)
+        if code[0] not in ('0', '3', '6', '8'):
+            return False, query
+        # Strip the code from query to avoid getting 行情 instead of 新闻
+        clean = cls._ASTOCK_CODE_RE.sub('', query).strip()
+        # If nothing left after stripping code, keep original
+        if not clean:
+            return True, query
+        return True, clean
 
-    @classmethod
-    def _extract_public_instances(cls, payload: Any) -> List[str]:
-        if not isinstance(payload, dict):
-            return []
+    def _parse_cli_output(self, query: str, stdout: str, max_results: int) -> SearchResponse:
+        """Parse the markdown output from anysearch_cli.py into SearchResponse."""
+        results: List[SearchResult] = []
+        entries: List[dict] = []
+        current: Optional[dict] = None
 
-        instances = payload.get("instances")
-        if not isinstance(instances, dict):
-            return []
+        for line in stdout.splitlines():
+            line = line.rstrip()
 
-        ranked: List[Tuple[float, float, str]] = []
-        for raw_url, item in instances.items():
-            if not isinstance(raw_url, str) or not isinstance(item, dict):
+            # New entry: ### N. Title
+            title_match = re.match(r'^###\s+\d+\.\s+(.*)', line)
+            if title_match:
+                if current is not None:
+                    entries.append(current)
+                current = {
+                    "title": title_match.group(1).strip(),
+                    "url": "",
+                    "snippet": "",
+                    "date": "",
+                }
                 continue
-            if item.get("network_type") != "normal":
-                continue
-            http_status = (item.get("http") or {}).get("status_code")
-            if http_status != 200:
-                continue
-            timing = (item.get("timing") or {}).get("search") or {}
-            uptime = timing.get("success_percentage")
-            if not isinstance(uptime, (int, float)) or float(uptime) <= 0:
+
+            if current is None:
                 continue
 
-            ranked.append(
-                (
-                    float(uptime),
-                    cls._search_latency_seconds(item),
-                    raw_url.rstrip("/"),
-                )
-            )
+            # URL line: - **URL**: https://...
+            url_match = re.match(r'^-\s+\*\*URL\*\*:\s+(.*)', line)
+            if url_match:
+                current["url"] = url_match.group(1).strip()
+                continue
 
-        ranked.sort(key=lambda row: (-row[0], row[1], row[2]))
-        return [url for _, _, url in ranked[: cls.PUBLIC_INSTANCES_POOL_LIMIT]]
+            # Date line: date: 2 days ago / date: Jan 5, 2026
+            date_match = re.match(r'^date:\s+(.*)', line)
+            if date_match:
+                raw_date = date_match.group(1).strip()
+                # Try to parse relative dates
+                current["date"] = self._normalize_date(raw_date)
+                continue
 
-    @classmethod
-    def _get_public_instances(cls) -> List[str]:
-        now = time.time()
-        with cls._public_instances_lock:
-            stale_urls: List[str] = []
-            if cls._public_instances_cache is None and cls._public_instances_stale_retry_after > now:
-                logger.debug(
-                    "[SearXNG] 公共实例冷启动刷新退避中，剩余 %.0fs",
-                    cls._public_instances_stale_retry_after - now,
-                )
-                return []
-            if cls._public_instances_cache is not None:
-                cached_at, cached_urls = cls._public_instances_cache
-                if now - cached_at < cls.PUBLIC_INSTANCES_CACHE_TTL_SECONDS:
-                    return list(cached_urls)
-                stale_urls = list(cached_urls)
-                if cls._public_instances_stale_retry_after > now:
-                    logger.debug(
-                        "[SearXNG] 公共实例刷新退避中，继续使用过期缓存，剩余 %.0fs",
-                        cls._public_instances_stale_retry_after - now,
-                    )
-                    return stale_urls
+            # Snippet lines: start with "- " after URL, or continuation text
+            if line.startswith('- '):
+                current["snippet"] += line[2:].strip() + " "
+            elif line and not line.startswith('#') and not line.startswith('**'):
+                # Skip header/separator lines
+                current["snippet"] += line.strip() + " "
 
-            try:
-                response = requests.get(
-                    cls.PUBLIC_INSTANCES_URL,
-                    timeout=cls.PUBLIC_INSTANCES_TIMEOUT_SECONDS,
-                )
-                if response.status_code != 200:
-                    logger.warning(
-                        "[SearXNG] 拉取公共实例列表失败: HTTP %s",
-                        response.status_code,
-                    )
-                else:
-                    urls = cls._extract_public_instances(response.json())
-                    if urls:
-                        cls._public_instances_cache = (now, list(urls))
-                        cls._public_instances_stale_retry_after = 0.0
-                        logger.info("[SearXNG] 已刷新公共实例池，共 %s 个候选实例", len(urls))
-                        return list(urls)
-                    logger.warning("[SearXNG] searx.space 未返回可用公共实例，保留已有缓存")
-            except Exception as exc:
-                logger.warning("[SearXNG] 拉取公共实例列表失败: %s", exc)
+        # Flush last entry
+        if current is not None:
+            entries.append(current)
 
-            if stale_urls:
-                cls._public_instances_stale_retry_after = (
-                    now + cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS
-                )
-                logger.warning(
-                    "[SearXNG] 公共实例刷新失败，继续使用过期缓存，共 %s 个候选实例；"
-                    "%.0fs 内不再刷新",
-                    len(stale_urls),
-                    cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS,
-                )
-                return stale_urls
-            cls._public_instances_stale_retry_after = (
-                now + cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS
-            )
-            logger.warning(
-                "[SearXNG] 公共实例冷启动刷新失败，%.0fs 内不再刷新",
-                cls.PUBLIC_INSTANCES_STALE_REFRESH_BACKOFF_SECONDS,
-            )
-            return []
+        # Convert to SearchResult, filter out pure 行情 data
+        for entry in entries:
+            title = entry.get("title", "")
+            url = entry.get("url", "")
+            snippet = entry.get("snippet", "").strip()[:500]
+            pub_date = entry.get("date", "") or None
 
-    def _rotate_candidates(self, pool: List[str], *, max_attempts: int) -> List[str]:
-        if not pool or max_attempts <= 0:
-            return []
-        with self._cursor_lock:
-            start = self._cursor % len(pool)
-            self._cursor = (self._cursor + 1) % len(pool)
-        ordered = pool[start:] + pool[:start]
-        return ordered[:max_attempts]
+            # Skip raw JSON market data entries
+            if snippet.startswith('{') and '"ts_code"' in snippet:
+                continue
+            if title and '日线行情' in title:
+                continue
 
-    def _do_search(  # type: ignore[override]
-        self,
-        query: str,
-        base_url: str,
-        max_results: int,
-        days: int = 7,
-        *,
-        timeout: int,
-        retry_enabled: bool,
-    ) -> SearchResponse:
-        """Execute one SearXNG search against a specific instance."""
+            results.append(SearchResult(
+                title=title,
+                snippet=snippet,
+                url=url,
+                source=self._extract_domain(url) if url else "anysearch",
+                published_date=pub_date or self._extract_date_from_url(url),
+            ))
+
+        return SearchResponse(
+            query=query,
+            results=results[:max_results],
+            provider=self._name,
+            success=len(results) > 0,
+            error_message="" if results else "AnySearch 未返回新闻结果",
+        )
+
+    @staticmethod
+    def _extract_date_from_url(url: str) -> Optional[str]:
+        """Try to extract YYYY-MM-DD from URL path.
+        Handles common patterns:
+          /2026-05-28/...
+          /2026/0528/...
+          /20260528/...
+          /20260528Axxx       (qq.com, 163.com)
+          /2026/05/28/...     (cctv etc.)
+          /2026-05/28/...
+        """
+        if not url:
+            return None
+        # Pattern 1: /YYYY-MM-DD/
+        m = re.search(r'/(\d{4}-\d{2}-\d{2})/', url)
+        if m:
+            return m.group(1)
+        # Pattern 2: /YYYY/MMDD/
+        m = re.search(r'/(\d{4})/(\d{2})(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # Pattern 3a: /YYYY/MM/DD/  (cctv etc)
+        m = re.search(r'/(\d{4})/(\d{2})/(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # Pattern 3b: /YYYYMMDD/  (10jqka etc)
+        m = re.search(r'/(\d{4})(\d{2})(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # Pattern 4: /YYYYMMDDxxx  (qq, 163 article ids)
+        m = re.search(r'/(\d{4})(\d{2})(\d{2})[A-Z]', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # Pattern 5: /YYYY-MM/DD/
+        m = re.search(r'/(\d{4})-(\d{2})/(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return None
+
+    @staticmethod
+    def _normalize_date(raw: str) -> str:
+        """Normalize date string to YYYY-MM-DD where possible."""
+        # Already in YYYY-MM-DD format
+        if re.match(r'^\d{4}-\d{2}-\d{2}', raw):
+            return raw[:10]
+        # Relative: "N days ago", "N hours ago", "yesterday"
+        now = date.today()
+        m = re.match(r'(\d+)\s+days?\s+ago', raw)
+        if m:
+            return (now - timedelta(days=int(m.group(1)))).isoformat()
+        m = re.match(r'(\d+)\s+hours?\s+ago', raw)
+        if m:
+            return now.isoformat()
+        if 'yesterday' in raw.lower() or '1 day ago' in raw:
+            return (now - timedelta(days=1)).isoformat()
+        # Month day, year: "Jan 5, 2026"
         try:
-            base = base_url.rstrip("/")
-            search_url = base if base.endswith("/search") else base + "/search"
-
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            }
-            params = {
-                "q": query,
-                "format": "json",
-                "time_range": self._time_range(days),
-                "pageno": 1,
-            }
-
-            request_get = _get_with_retry if retry_enabled else requests.get
-            response = request_get(search_url, headers=headers, params=params, timeout=timeout)
-
-            if response.status_code != 200:
-                error_msg = self._parse_http_error(response)
-                if response.status_code == 403:
-                    error_msg = (
-                        f"{error_msg}；SearXNG 实例可能未启用 JSON 输出（请检查 settings.yml），"
-                        "或实例/代理拒绝了本次访问"
-                    )
-                return SearchResponse(
-                    query=query,
-                    results=[],
-                    provider=self.name,
-                    success=False,
-                    error_message=error_msg,
-                )
-
-            try:
-                data = response.json()
-            except Exception:
-                return SearchResponse(
-                    query=query,
-                    results=[],
-                    provider=self.name,
-                    success=False,
-                    error_message="响应JSON解析失败",
-                )
-
-            if not isinstance(data, dict):
-                return SearchResponse(
-                    query=query,
-                    results=[],
-                    provider=self.name,
-                    success=False,
-                    error_message="响应格式无效",
-                )
-
-            raw = data.get("results", [])
-            if not isinstance(raw, list):
-                raw = []
-
-            results = []
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                url_val = item.get("url")
-                if not url_val:
-                    continue
-                raw_published_date = item.get("publishedDate")
-
-                snippet = (item.get("content") or item.get("description") or "")[:500]
-                published_date = None
-                if raw_published_date:
-                    try:
-                        dt = datetime.fromisoformat(raw_published_date.replace("Z", "+00:00"))
-                        published_date = dt.strftime("%Y-%m-%d")
-                    except (ValueError, AttributeError):
-                        published_date = raw_published_date
-
-                results.append(
-                    SearchResult(
-                        title=item.get("title", ""),
-                        snippet=snippet,
-                        url=url_val,
-                        source=self._extract_domain(url_val),
-                        published_date=published_date,
-                    )
-                )
-                if len(results) >= max_results:
-                    break
-
-            return SearchResponse(query=query, results=results, provider=self.name, success=True)
-
-        except requests.exceptions.Timeout:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message="请求超时",
-            )
-        except requests.exceptions.RequestException as e:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=f"网络请求失败: {e}",
-            )
-        except Exception as e:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=f"未知错误: {e}",
-            )
+            from datetime import datetime as dt
+            parsed = dt.strptime(raw, "%b %d, %Y")
+            return parsed.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+        # YYYYMMDD in URL path (common for Chinese news)
+        return raw[:10] if len(raw) >= 10 else raw
 
     @staticmethod
     def _extract_domain(url: str) -> str:
-        """Extract domain from URL as source label."""
         try:
-            from urllib.parse import urlparse
-
             parsed = urlparse(url)
-            domain = parsed.netloc.replace("www.", "")
-            return domain or "未知来源"
+            return parsed.netloc.replace("www.", "") or "anysearch"
         except Exception:
-            return "未知来源"
-
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
-        """Execute SearXNG search with instance rotation and per-request failover."""
-        start_time = time.time()
-        if self._base_urls:
-            candidates = self._rotate_candidates(
-                self._base_urls,
-                max_attempts=len(self._base_urls),
-            )
-            retry_enabled = True
-            timeout = self.SELF_HOSTED_TIMEOUT_SECONDS
-            empty_error = "SearXNG 未配置可用实例"
-        elif self._use_public_instances:
-            public_instances = self._get_public_instances()
-            candidates = self._rotate_candidates(
-                public_instances,
-                max_attempts=min(len(public_instances), self.PUBLIC_INSTANCES_MAX_ATTEMPTS),
-            )
-            retry_enabled = False
-            timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
-            empty_error = "未获取到可用的公共 SearXNG 实例"
-        else:
-            candidates = []
-            retry_enabled = False
-            timeout = self.PUBLIC_INSTANCES_TIMEOUT_SECONDS
-            empty_error = "SearXNG 未配置可用实例"
-
-        if not candidates:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=empty_error,
-                search_time=time.time() - start_time,
-            )
-
-        errors: List[str] = []
-        for base_url in candidates:
-            response = self._do_search(
-                query,
-                base_url,
-                max_results,
-                days=days,
-                timeout=timeout,
-                retry_enabled=retry_enabled,
-            )
-            response.search_time = time.time() - start_time
-            if response.success:
-                logger.info(
-                    "[%s] 搜索 '%s' 成功，实例=%s，返回 %s 条结果，耗时 %.2fs",
-                    self.name,
-                    query,
-                    base_url,
-                    len(response.results),
-                    response.search_time,
-                )
-                return response
-
-            errors.append(f"{base_url}: {response.error_message or '未知错误'}")
-            logger.warning("[%s] 实例 %s 搜索失败: %s", self.name, base_url, response.error_message)
-
-        elapsed = time.time() - start_time
-        return SearchResponse(
-            query=query,
-            results=[],
-            provider=self.name,
-            success=False,
-            error_message="；".join(errors[:3]) if errors else empty_error,
-            search_time=elapsed,
-        )
+            return "anysearch"
 
 
 class SearchService:
@@ -2169,8 +2275,7 @@ class SearchService:
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
-        searxng_base_urls: Optional[List[str]] = None,
-        searxng_public_instances_enabled: bool = True,
+        anysearch_keys: Optional[List[str]] = None,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2184,8 +2289,7 @@ class SearchService:
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
-            searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
-            searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            anysearch_keys: AnySearch API Key 列表（可选，匿名访问亦可用但限额较低）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2233,17 +2337,19 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
-        searxng_provider = SearXNGSearchProvider(
-            searxng_base_urls,
-            use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
+        # 6. AnySearch（中文 A 股垊直搜索强项，匿名亦可用，可API Key 提高限额）
+        anysearch_provider = AnySearchProvider(
+            anysearch_keys,
+            daily_limit=int(os.getenv("ANYSEARCH_DAILY_LIMIT", "0").strip()) or None,
         )
-        if searxng_provider.is_available:
-            self._providers.append(searxng_provider)
-            if searxng_base_urls:
-                logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
+        if anysearch_provider.is_available:
+            self._providers.append(anysearch_provider)
+            if anysearch_keys:
+                logger.info("已配置 AnySearch 搜索，共 %s 个 API Key", len(anysearch_keys))
             else:
-                logger.info("已启用 SearXNG 公共实例自动发现模式")
+                logger.info("已启用 AnySearch 匿名搜索（限额较低，建议配置 ANYSEARCH_API_KEYS）")
+        else:
+            logger.warning("AnySearch CLI 未找到，跳过该提供者")
 
         # 7. Anspire Search（实时智能搜索优化）
         if anspire_keys:
@@ -3038,8 +3144,15 @@ class SearchService:
 
         for item in response.results:
             published = self._normalize_news_publish_date(item.published_date)
+            # Fallback: try extracting date from URL if published_date is None
+            if published is None and item.url:
+                published = AnySearchProvider._extract_date_from_url(item.url)
             if published is None:
                 dropped_unknown += 1
+                # When freshness filtering is active, the search engine already ranked
+                # by recency.  Dropping all date-unknown results would leave 0 items.
+                # Keep them with a caution flag so downstream code can still use them.
+                filtered.append(item)
                 continue
             if published < earliest:
                 dropped_old += 1
@@ -3919,8 +4032,7 @@ def get_search_service() -> SearchService:
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
                     minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    anysearch_keys=config.anysearch_api_keys,
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

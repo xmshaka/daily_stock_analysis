@@ -72,3 +72,19 @@ class SuccessResponse(BaseModel):
             "data": None
         }
     })
+
+
+class VersionResponse(BaseModel):
+    """版本信息响应"""
+    
+    version: str = Field(..., description="API 版本号", json_schema_extra={"example": "1.0.0"})
+    commit: Optional[str] = Field(None, description="Git commit hash", json_schema_extra={"example": "abc1234"})
+    build_time: Optional[str] = Field(None, description="构建时间", json_schema_extra={"example": "2024-01-01T12:00:00"})
+    
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "version": "1.0.0",
+            "commit": "abc1234",
+            "build_time": "2024-01-01T12:00:00"
+        }
+    })

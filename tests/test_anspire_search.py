@@ -398,7 +398,6 @@ class TestAnspireSearchService(unittest.TestCase):
             anspire_keys=["test_key"],
             bocha_keys=[],
             tavily_keys=[],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short"
         )
@@ -416,7 +415,6 @@ class TestAnspireSearchService(unittest.TestCase):
             anspire_keys=[],
             tavily_keys=["tavily_key"],
             bocha_keys=[],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short"
         )
@@ -431,7 +429,6 @@ class TestAnspireSearchService(unittest.TestCase):
             anspire_keys=["anspire_key"],
             bocha_keys=["bocha_key"],
             tavily_keys=["tavily_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short"
         )
@@ -555,7 +552,6 @@ def run_manual_test():
         anspire_keys=config.anspire_api_keys,
         bocha_keys=config.bocha_api_keys,
         tavily_keys=config.tavily_keys,
-        searxng_public_instances_enabled=False,
         news_max_age_days=3,
         news_strategy_profile="short"
     )

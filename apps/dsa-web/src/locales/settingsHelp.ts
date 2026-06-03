@@ -219,13 +219,13 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响新闻检索覆盖度、时效性和 Agent/报告中的外部信息。'],
     notes: ['搜索服务可能有额度、限流和地区可用性差异。'],
   },
-  'settings.data_source.SEARXNG_BASE_URLS': {
-    title: 'SearXNG 实例地址',
-    summary: '配置自建或可信 SearXNG 搜索实例。',
-    usage: '多个实例使用英文逗号分隔；自建实例需要启用 JSON 输出格式。',
-    valueNotes: ['禁用公开实例自动发现后，只会使用这里配置的实例。'],
-    impact: ['影响无商业搜索 Key 时的新闻和网页搜索兜底能力。'],
-    notes: ['公共实例稳定性不可控，生产环境建议使用自建或可信实例。'],
+  'settings.data_source.ANYSEARCH_DAILY_LIMIT': {
+    title: 'AnySearch 每日调用上限',
+    summary: '限制 AnySearch 的每日调用次数，超过后本日不再调用。',
+    usage: '匿名模式默认 200；配置 API Key 后可适当调高（例如 2000）。',
+    valueNotes: ['设为 0 等价于禁用 AnySearch。'],
+    impact: ['限制 AnySearch 调用次数，避免超额被封禁。'],
+    notes: ['与 LRU 缓存、熜断器配合使用。'],
   },
   'settings.data_source.ENABLE_CHIP_DISTRIBUTION': {
     title: '筹码分布分析',
@@ -1152,13 +1152,13 @@ const settingsHelpEnUS: SettingsHelpMap = {
     impact: ['Affects news coverage and external information in reports or Agent flows.'],
     notes: ['Search services can differ in quota, rate limits, and regional availability.'],
   },
-  'settings.data_source.SEARXNG_BASE_URLS': {
-    title: 'SearXNG URLs',
-    summary: 'Configures self-hosted or trusted SearXNG search instances.',
-    usage: 'Use comma-separated URLs. Self-hosted instances should enable JSON output.',
-    valueNotes: ['When public discovery is disabled, only these instances are used.'],
-    impact: ['Affects fallback web search when commercial search keys are absent.'],
-    notes: ['For production, prefer self-hosted or trusted instances over public ones.'],
+  'settings.data_source.ANYSEARCH_DAILY_LIMIT': {
+    title: 'AnySearch Daily Limit',
+    summary: 'Caps the number of AnySearch calls per day; further calls are skipped once the quota is hit.',
+    usage: 'Anonymous mode defaults to 200; raise it (e.g. 2000) after configuring an API key.',
+    valueNotes: ['Setting it to 0 effectively disables AnySearch.'],
+    impact: ['Bounds AnySearch usage to avoid being throttled or blocked.'],
+    notes: ['Works together with the LRU cache and circuit breaker.'],
   },
   'settings.data_source.ENABLE_CHIP_DISTRIBUTION': {
     title: 'Chip Distribution',

@@ -36,7 +36,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有观望"},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "110元"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110元", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -56,7 +56,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有"},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -76,7 +76,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -96,7 +96,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "   "},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -156,7 +156,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有"},
                 "intelligence": {},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -176,7 +176,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有"},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
 
@@ -203,7 +203,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有"},
                 "intelligence": {"risk_alerts": None},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -223,7 +223,7 @@ class TestCheckContentIntegrity(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有"},
                 "intelligence": {"risk_alerts": "需留意"},
-                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "108元", "secondary_buy": "106元", "stop_loss": "110", "take_profit": "120元"}},
             },
         )
         ok, missing = check_content_integrity(result)
@@ -464,7 +464,7 @@ class TestApplyPlaceholderFill(unittest.TestCase):
             dashboard={
                 "core_conclusion": {"one_sentence": "持有观望"},
                 "intelligence": {"risk_alerts": []},
-                "battle_plan": {"sniper_points": {"stop_loss": "100"}},
+                "battle_plan": {"sniper_points": {"ideal_buy": "98元", "secondary_buy": "96元", "stop_loss": "100", "take_profit": "110元"}},
                 "phase_decision": {
                     "phase_context": "invalid",
                     "watch_conditions": "invalid",

@@ -1,0 +1,197 @@
+diff --git a/src/search_service.py b/src/search_service.py
+index bce5d46..01bb712 100644
+--- a/src/search_service.py
++++ b/src/search_service.py
+@@ -2169,6 +2169,7 @@ class SearchService:
+         brave_keys: Optional[List[str]] = None,
+         serpapi_keys: Optional[List[str]] = None,
+         minimax_keys: Optional[List[str]] = None,
++        anysearch_keys: Optional[List[str]] = None,
+         searxng_base_urls: Optional[List[str]] = None,
+         searxng_public_instances_enabled: bool = True,
+         news_max_age_days: int = 3,
+@@ -2233,7 +2234,15 @@ class SearchService:
+             self._providers.append(MiniMaxSearchProvider(minimax_keys))
+             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
+ 
+-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
++        # 6. AnySearch（中国A股垂直搜索，匿名免费 + 可选API Key）
++        anysearch_provider = AnySearchProvider(anysearch_keys)
++        self._providers.append(anysearch_provider)
++        if anysearch_keys:
++            logger.info("已配置 AnySearch 搜索，共 %s 个 API Key", len(anysearch_keys))
++        else:
++            logger.info("已启用 AnySearch 匿名搜索（rate limit 较低时建议配置 API Key）")
++
++        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+         searxng_provider = SearXNGSearchProvider(
+             searxng_base_urls,
+             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
+@@ -3955,3 +3964,167 @@ if __name__ == "__main__":
+         print("\n" + response.to_context())
+     else:
+         print("未配置搜索能力，跳过测试")
++
++
++# ========== AnySearch Provider (appended) ==========
++
++class AnySearchProvider(BaseSearchProvider):
++    """
++    AnySearch search engine (free anonymous + optional API key).
++    Supports vertical domain search for Chinese A-shares via finance.cn_stock.
++    """
++
++    API_BASE = "https://api.anysearch.com"
++    DEFAULT_TIMEOUT = 15
++    CN_STOCK_DOMAIN = "finance.cn_stock"
++
++    def __init__(self, api_keys: Optional[List[str]] = None):
++        # anysearch supports anonymous access; pass empty list if no key.
++        keys = api_keys or []
++        super().__init__(keys, "AnySearch")
++
++    @property
++    def is_available(self) -> bool:
++        # Always available because anonymous access is supported.
++        return True
++
++    def _execute_search(
++        self,
++        query: str,
++        *,
++        max_results: int = 5,
++        days: int = 7,
++        api_key: Optional[str] = None,
++        **search_kwargs: Any,
++    ) -> SearchResponse:
++        """Override base flow: AnySearch supports anonymous access, skip the API key gate."""
++        api_key = api_key or self._get_next_key() or ""  # empty key = anonymous
++        start_time = time.time()
++        try:
++            response = self._do_search(query, api_key, max_results, days=days, **search_kwargs)
++            response.search_time = time.time() - start_time
++            if response.success:
++                if api_key:
++                    self._record_success(api_key)
++                logger.info(
++                    f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s"
++                )
++            else:
++                if api_key:
++                    self._record_error(api_key)
++            return response
++        except Exception as e:
++            if api_key:
++                self._record_error(api_key)
++            elapsed = time.time() - start_time
++            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
++            return SearchResponse(
++                query=query, results=[], provider=self._name,
++                success=False, error_message=str(e), search_time=elapsed,
++            )
++
++    def _do_search(
++        self,
++        query: str,
++        api_key: str,
++        max_results: int,
++        days: int = 7,
++    ) -> SearchResponse:
++        """
++        Execute anysearch query.
++        Strategy: prefer finance.cn_stock vertical for A-share codes,
++        fallback to general search.
++        """
++        # Determine if query is a stock code (6 digits) + name pattern.
++        is_stock_code = len(query) >= 6 and query[:6].isdigit()
++
++        # Build URL
++        url = f"{self.API_BASE}/search"
++        params = {
++            "q": query,
++            "max_results": min(max_results * 2, 20),  # fetch extra for filtering
++        }
++        headers = {"User-Agent": "Mozilla/5.0"}
++
++        if api_key:
++            headers["Authorization"] = f"Bearer {api_key}"
++
++        if is_stock_code:
++            # Try vertical search first
++            params["domain"] = "finance"
++            params["sub_domain"] = self.CN_STOCK_DOMAIN
++
++        try:
++            response = requests.get(url, params=params, headers=headers, timeout=self.DEFAULT_TIMEOUT)
++            response.raise_for_status()
++            data = response.json()
++        except requests.exceptions.Timeout:
++            return SearchResponse(
++                query=query, results=[], provider=self.name,
++                success=False, error_message="AnySearch 请求超时"
++            )
++        except requests.exceptions.HTTPError as e:
++            if e.response.status_code == 429:
++                return SearchResponse(
++                    query=query, results=[], provider=self.name,
++                    success=False, error_message="AnySearch rate limit exceeded (try adding API_KEY)"
++                )
++            return SearchResponse(
++                query=query, results=[], provider=self.name,
++                success=False, error_message=f"AnySearch HTTP error: {e}"
++            )
++        except Exception as e:
++            return SearchResponse(
++                query=query, results=[], provider=self.name,
++                success=False, error_message=f"AnySearch error: {e}"
++            )
++
++        return self._parse_results(query, data, max_results, days)
++
++    def _parse_results(self, query: str, data: dict, max_results: int, days: int) -> SearchResponse:
++        """Parse anysearch response into SearchResult list."""
++        results = []
++        raw = data.get("results", [])
++        if not isinstance(raw, list):
++            raw = []
++
++        for item in raw:
++            if not isinstance(item, dict):
++                continue
++            url_val = item.get("url") or item.get("link")
++            if not url_val:
++                continue
++
++            snippet = (item.get("snippet") or item.get("description") or item.get("content") or "")[:500]
++            title = item.get("title", "")
++            source = item.get("source") or self._extract_domain(url_val)
++            published_date = item.get("date") or item.get("publishedDate")
++
++            # Normalize date
++            if published_date and isinstance(published_date, str):
++                published_date = published_date[:10]  # YYYY-MM-DD
++
++            results.append(
++                SearchResult(
++                    title=title,
++                    snippet=snippet,
++                    url=url_val,
++                    source=source,
++                    published_date=published_date,
++                )
++            )
++            if len(results) >= max_results:
++                break
++
++        return SearchResponse(
++            query=query, results=results, provider=self.name, success=True
++        )
++
++    @staticmethod
++    def _extract_domain(url: str) -> str:
++        from urllib.parse import urlparse
++        try:
++            parsed = urlparse(url)
++            return parsed.netloc.replace("www.", "") or "anysearch"
++        except Exception:
++            return "anysearch"

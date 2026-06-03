@@ -72,7 +72,6 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
 
     def test_get_cached_or_reserve_prefers_cached_response(self):
         service = SearchService(
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -125,7 +124,6 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
 
     def test_search_stock_news_coalesces_concurrent_cache_fill(self):
         service = SearchService(
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -186,7 +184,6 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
 
     def test_search_stock_news_rechecks_cache_after_wait_before_provider_search(self):
         service = SearchService(
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -237,8 +234,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
             brave_api_keys=[],
             serpapi_keys=[],
             minimax_api_keys=[],
-            searxng_base_urls=[],
-            searxng_public_instances_enabled=False,
+            anysearch_api_keys=[],
             news_max_age_days=3,
             news_strategy_profile="short",
             anspire_api_keys=[],

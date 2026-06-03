@@ -141,8 +141,7 @@ class StockAnalysisPipeline:
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
-                searxng_base_urls=self.config.searxng_base_urls,
-                searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
+                anysearch_keys=getattr(self.config, "anysearch_api_keys", None),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )
@@ -1419,12 +1418,17 @@ class StockAnalysisPipeline:
     def _is_agent_placeholder_text(text: str) -> bool:
         if not text:
             return True
-        return text.lower() in {"n/a", "na", "none", "null", "unknown", "tbd"} or text in {
-            "未知",
-            "待补充",
-            "数据缺失",
-            "无",
-        }
+        lower = text.lower().strip()
+        if lower in {"n/a", "na", "none", "null", "unknown", "tbd"}:
+            return True
+        # Prefix-based matching for LLM-generated placeholder phrases
+        placeholder_prefixes = (
+            "未知", "待补充", "数据缺失", "无",
+            "无法判断", "暂无", "不适用",
+            "to be completed", "data unavailable",
+            "not available", "cannot determine",
+        )
+        return any(lower.startswith(p) for p in placeholder_prefixes)
 
     @staticmethod
     def _is_agent_field_missing(
@@ -1570,7 +1574,7 @@ class StockAnalysisPipeline:
             risk_factors = getattr(trend_result, "risk_factors", None) or []
             intelligence["risk_alerts"] = list(risk_factors)
 
-        if result.decision_type in ("buy", "hold"):
+        if result.decision_type in ("buy", "hold", "sell"):
             battle = dashboard.get("battle_plan")
             if not isinstance(battle, dict):
                 battle = {}
@@ -1579,11 +1583,87 @@ class StockAnalysisPipeline:
             if not isinstance(sniper_points, dict):
                 sniper_points = {}
                 battle["sniper_points"] = sniper_points
+
+            # Resolve support/resistance from multiple sources
+            support = None
+            resistance = None
+            if trend_result and getattr(trend_result, "support_levels", None):
+                support = trend_result.support_levels[0]
+            if trend_result and getattr(trend_result, "resistance_levels", None):
+                resistance = trend_result.resistance_levels[0]
+            # Fallback to data_perspective price_position
+            if not support or not resistance:
+                dp = dashboard.get("data_perspective") if isinstance(dashboard.get("data_perspective"), dict) else {}
+                pp = dp.get("price_position") if isinstance(dp.get("price_position"), dict) else {}
+                if not support:
+                    support = pp.get("support_level") or pp.get("supportLevel")
+                    if isinstance(support, str):
+                        try:
+                            support = float(support)
+                        except (ValueError, TypeError):
+                            support = None
+                if not resistance:
+                    resistance = pp.get("resistance_level") or pp.get("resistanceLevel")
+                    if isinstance(resistance, str):
+                        try:
+                            resistance = float(resistance)
+                        except (ValueError, TypeError):
+                            resistance = None
+
+            price = result.current_price
+            is_bearish = result.trend_prediction in ("看空", "强烈看空") if result.trend_prediction else False
+            if not is_bearish:
+                # Also check data_perspective trend_status for bearish MA alignment
+                dp2 = dashboard.get("data_perspective") if isinstance(dashboard.get("data_perspective"), dict) else {}
+                ts2 = dp2.get("trend_status") if isinstance(dp2.get("trend_status"), dict) else {}
+                ma_align = str(ts2.get("ma_alignment", "")).lower()
+                if "空头" in ma_align or "bearish" in ma_align:
+                    is_bearish = True
+
             if self._is_agent_field_missing(sniper_points.get("stop_loss"), scalar=True):
-                sniper_points["stop_loss"] = self._stop_loss_fallback_from_trend(
-                    trend_result,
-                    report_language,
-                )
+                # For bearish: stop_loss = support break level; for others: trend fallback
+                if is_bearish and support and isinstance(support, (int, float)) and support > 0:
+                    sniper_points["stop_loss"] = round(support * 0.98, 2)
+                else:
+                    sniper_points["stop_loss"] = self._stop_loss_fallback_from_trend(
+                        trend_result, report_language,
+                    )
+
+            if self._is_agent_field_missing(sniper_points.get("ideal_buy"), scalar=True):
+                if is_bearish:
+                    # Bearish: show as watch level, not buy point
+                    if support and isinstance(support, (int, float)) and support > 0:
+                        sniper_points["ideal_buy"] = f"{round(support * 0.98, 2)}元（下方关键支撑观察位）"
+                    elif price and price > 0:
+                        sniper_points["ideal_buy"] = f"{round(price * 0.95, 2)}元（下方关键支撑观察位）"
+                    else:
+                        sniper_points["ideal_buy"] = "待补充" if report_language == "zh" else "To be completed"
+                else:
+                    sniper_points["ideal_buy"] = round(support * 0.98, 2) if support and isinstance(support, (int, float)) and support > 0 else (round(price * 0.98, 2) if price and price > 0 else ("待补充" if report_language == "zh" else "To be completed"))
+
+            if self._is_agent_field_missing(sniper_points.get("secondary_buy"), scalar=True):
+                if is_bearish:
+                    if support and isinstance(support, (int, float)) and support > 0:
+                        sniper_points["secondary_buy"] = f"{round(support * 0.95, 2)}元（深度回踩观察位）"
+                    elif price and price > 0:
+                        sniper_points["secondary_buy"] = f"{round(price * 0.92, 2)}元（深度回踩观察位）"
+                    else:
+                        sniper_points["secondary_buy"] = "待补充" if report_language == "zh" else "To be completed"
+                else:
+                    sniper_points["secondary_buy"] = round(support * 0.95, 2) if support and isinstance(support, (int, float)) and support > 0 else (round(price * 0.95, 2) if price and price > 0 else ("待补充" if report_language == "zh" else "To be completed"))
+
+            if self._is_agent_field_missing(sniper_points.get("take_profit"), scalar=True):
+                if is_bearish:
+                    # Bearish: take_profit = rebound target (resistance or MA)
+                    if resistance and isinstance(resistance, (int, float)) and resistance > 0:
+                        sniper_points["take_profit"] = f"{round(resistance * 0.99, 2)}元（反弹压力位，减仓线）"
+                    elif price and price > 0:
+                        sniper_points["take_profit"] = f"{round(price * 1.05, 2)}元（反弹减仓线）"
+                    else:
+                        sniper_points["take_profit"] = "待补充" if report_language == "zh" else "To be completed"
+                else:
+                    target = resistance if resistance and isinstance(resistance, (int, float)) and resistance > 0 else (price * 1.08 if price and price > 0 else None)
+                    sniper_points["take_profit"] = round(target, 2) if target else ("待补充" if report_language == "zh" else "To be completed")
 
     @staticmethod
     def _stop_loss_fallback_from_trend(

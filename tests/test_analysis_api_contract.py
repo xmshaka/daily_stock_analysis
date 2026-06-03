@@ -249,8 +249,6 @@ class AnalysisApiContractTestCase(unittest.TestCase):
             brave_api_keys=["brave"],
             serpapi_keys=["serpapi"],
             minimax_api_keys=["minimax"],
-            searxng_base_urls=["http://searxng.local"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=5,
             news_strategy_profile="balanced",
             gemini_api_key="gemini-key",

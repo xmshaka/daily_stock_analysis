@@ -17,8 +17,6 @@ def _make_config() -> SimpleNamespace:
         brave_api_keys=[],
         serpapi_keys=[],
         minimax_api_keys=[],
-        searxng_base_urls=[],
-        searxng_public_instances_enabled=False,
         news_max_age_days=7,
         news_strategy_profile="short",
         enable_realtime_quote=False,

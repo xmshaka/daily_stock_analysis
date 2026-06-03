@@ -143,7 +143,6 @@ class TestTavilySearchProvider(unittest.TestCase):
                 ):
                     service = SearchService(
                         tavily_keys=["dummy_key"],
-                        searxng_public_instances_enabled=False,
                         news_max_age_days=3,
                         news_strategy_profile="short",
                     )
@@ -168,7 +167,6 @@ class TestTavilySearchProvider(unittest.TestCase):
         ):
             service = SearchService(
                 tavily_keys=["dummy_key"],
-                searxng_public_instances_enabled=False,
             )
             resp = service.search_stock_events("BABA", "阿里巴巴")
 
@@ -194,7 +192,6 @@ class TestTavilySearchProvider(unittest.TestCase):
         ):
             service = SearchService(
                 tavily_keys=["dummy_key"],
-                searxng_public_instances_enabled=False,
                 news_max_age_days=3,
                 news_strategy_profile="short",
             )
@@ -224,7 +221,6 @@ class TestTavilySearchProvider(unittest.TestCase):
         ):
             service = SearchService(
                 tavily_keys=["dummy_key"],
-                searxng_public_instances_enabled=False,
                 news_max_age_days=3,
                 news_strategy_profile="short",
             )
@@ -256,7 +252,6 @@ class TestTavilySearchProvider(unittest.TestCase):
         ):
             service = SearchService(
                 tavily_keys=["dummy_key"],
-                searxng_public_instances_enabled=False,
                 news_max_age_days=3,
                 news_strategy_profile="short",
             )

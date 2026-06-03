@@ -4,7 +4,8 @@ import { getFieldDescriptionZh, getFieldOptionLabelZh, getFieldTitleZh } from '.
 const requiredLocalizedKeys = [
   'TICKFLOW_API_KEY',
   'STOCK_INDEX_REMOTE_UPDATE_ENABLED',
-  'SEARXNG_BASE_URLS',
+  'ANYSEARCH_API_KEYS',
+  'ANYSEARCH_DAILY_LIMIT',
   'ENABLE_REALTIME_QUOTE',
   'ENABLE_CHIP_DISTRIBUTION',
   'PYTDX_HOST',
@@ -82,11 +83,11 @@ describe('systemConfigI18n required key coverage', () => {
     });
   });
 
-  it('uses a Chinese primary title for SearXNG base URLs', () => {
-    const title = getFieldTitleZh('SEARXNG_BASE_URLS', 'SEARXNG_BASE_URLS');
+  it('uses a Chinese primary title for AnySearch API keys', () => {
+    const title = getFieldTitleZh('ANYSEARCH_API_KEYS', 'ANYSEARCH_API_KEYS');
 
-    expect(title).toBe('SearXNG 自建实例地址');
-    expect(title).not.toBe('SearXNG Base URLs');
+    expect(title).toBe('AnySearch API Keys');
+    expect(title).not.toBe('AnySearch API Keys (fallback)');
   });
 });
 

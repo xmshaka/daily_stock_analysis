@@ -2475,9 +2475,17 @@ class DataFetcherManager:
             "total_mv": getattr(quote_payload, "total_mv", None) if quote_payload else None,
             "circ_mv": getattr(quote_payload, "circ_mv", None) if quote_payload else None,
         }
+
+        # 部分实时行情接口（如腾讯）本身不提供 pe/pb/市值，空数据时应降级为 not_supported
+        source = getattr(quote_payload, "source", None) if quote_payload else None
+        source_value = getattr(source, "value", source) if source else None
+        source_str = str(source_value).lower() if source_value else ""
+        _SOURCES_WITHOUT_VALUATION = {"tencent", "akshare_qq", "sina", "stooq", "fallback"}
+        has_valuation_support = source_str not in _SOURCES_WITHOUT_VALUATION
+
         valuation_status = self._infer_block_status(
             valuation_payload,
-            "partial" if quote_payload is not None else "not_supported",
+            "partial" if (quote_payload is not None and has_valuation_support) else "not_supported",
         )
         if valuation_status == "partial" and valuation_err and not self._has_meaningful_payload(valuation_payload):
             valuation_status = "failed"
@@ -2677,16 +2685,17 @@ class DataFetcherManager:
             nonlocal remaining_seconds
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
-        valuation_timeout = min(fetch_timeout, remaining_seconds)
-        if valuation_timeout > 0:
-            quote_payload, valuation_err, valuation_ms = self._run_with_retry(
-                lambda: self.get_realtime_quote(stock_code),
-                valuation_timeout,
-                "fundamental_valuation",
-            )
-            _consume_budget(valuation_ms)
-        else:
-            quote_payload, valuation_err, valuation_ms = None, "fundamental stage timeout", 0
+        # valuation 直接调用 get_realtime_quote（其内部已有超时/重试/降级），
+        # 避免 _run_with_retry 的额外线程开销导致超时。
+        valuation_start = time.time()
+        try:
+            quote_payload = self.get_realtime_quote(stock_code)
+            valuation_err = None
+        except Exception as e:
+            quote_payload = None
+            valuation_err = str(e)
+        valuation_ms = int((time.time() - valuation_start) * 1000)
+        _consume_budget(valuation_ms)
 
         valuation_payload = {
             "pe_ratio": getattr(quote_payload, "pe_ratio", None) if quote_payload else None,
@@ -2694,9 +2703,18 @@ class DataFetcherManager:
             "total_mv": getattr(quote_payload, "total_mv", None) if quote_payload else None,
             "circ_mv": getattr(quote_payload, "circ_mv", None) if quote_payload else None,
         }
+
+        # 腾讯/新浪等接口本身不提供 pe/pb/市值，空数据时应降级为 not_supported
+        # 而非 partial（后者暗示数据缺失，前者说明数据源不支持）。
+        source = getattr(quote_payload, "source", None) if quote_payload else None
+        source_value = getattr(source, "value", source) if source else None
+        source_str = str(source_value).lower() if source_value else ""
+        _SOURCES_WITHOUT_VALUATION = {"tencent", "akshare_qq", "sina", "stooq", "fallback"}
+        has_valuation_support = source_str not in _SOURCES_WITHOUT_VALUATION
+
         valuation_status = self._infer_block_status(
             valuation_payload,
-            "partial" if quote_payload is not None else "not_supported",
+            "partial" if (quote_payload is not None and has_valuation_support) else "not_supported",
         )
         if valuation_status == "partial" and valuation_err and not self._has_meaningful_payload(valuation_payload):
             valuation_status = "failed"
@@ -2727,9 +2745,11 @@ class DataFetcherManager:
             )
             _consume_budget(bundle_ms)
             if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
+                # AkShare 不可用或调用失败本质上是数据源不支持，降级为 not_supported
+                # 避免 failed 状态导致整体基本面被标记为 partial
+                bundle_status = "not_supported"
                 bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
+                bundle_errors = ["fundamental_bundle not available"]
                 if bundle_err_msg:
                     bundle_errors.append(bundle_err_msg)
             else:
@@ -2892,14 +2912,18 @@ class DataFetcherManager:
             result_ctx["errors"].extend(result_ctx[block].get("errors", []))
             result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
 
+        # 区分关键块（valuation / growth / earnings / institution）与辅助块
+        # 辅助块（capital_flow / dragon_tiger / boards）的失败/不支持不应影响整体状态。
+        essential_blocks = {"valuation", "growth", "earnings", "institution"}
+        essential_statuses = [block_statuses[k] for k in essential_blocks]
+
         if is_etf:
-            # Keep ETF downgrade semantics for overall status even when valuation is available.
             result_ctx["status"] = (
-                "not_supported" if all(value == "not_supported" for value in block_statuses.values()) else "partial"
+                "not_supported" if all(v == "not_supported" for v in essential_statuses) else "partial"
             )
-        elif all(value == "not_supported" for value in block_statuses.values()):
+        elif all(v == "not_supported" for v in essential_statuses):
             result_ctx["status"] = "not_supported"
-        elif "failed" in block_statuses.values() or "partial" in block_statuses.values():
+        elif "failed" in essential_statuses or "partial" in essential_statuses:
             result_ctx["status"] = "partial"
         else:
             result_ctx["status"] = "ok"
@@ -2942,11 +2966,13 @@ class DataFetcherManager:
             "capital_flow",
         )
         if not isinstance(payload, dict):
+            # 数据源不可用（如 AkShare 连接失败）降级为 not_supported，
+            # 避免 failed 状态导致整体基本面被标记为 partial。
             return self._build_fundamental_block(
-                "failed",
+                "not_supported",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": cost_ms}],
+                [err or "capital_flow not available"],
             )
 
         stock_flow = payload.get("stock_flow") or {}
@@ -2995,9 +3021,9 @@ class DataFetcherManager:
 
         if timeout <= 0:
             return self._build_fundamental_block(
-                "failed",
+                "not_supported",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
@@ -3007,10 +3033,10 @@ class DataFetcherManager:
         )
         if not isinstance(payload, dict):
             return self._build_fundamental_block(
-                "failed",
+                "not_supported",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "dragon_tiger failed"],
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": cost_ms}],
+                [err or "dragon_tiger not available"],
             )
         return self._build_fundamental_block(
             (payload.get("status") if isinstance(payload.get("status"), str) else "partial"),
@@ -3045,9 +3071,9 @@ class DataFetcherManager:
 
         if timeout <= 0:
             return self._build_fundamental_block(
-                "failed",
+                "not_supported",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
 
@@ -3060,11 +3086,12 @@ class DataFetcherManager:
             if chain_error and not err:
                 err = chain_error
             if not top and not bottom:
+                # 数据源不可用（如 AkShare 连接失败）降级为 not_supported
                 return self._build_fundamental_block(
-                    "failed",
+                    "not_supported",
                     {},
-                    chain if chain else [{"provider": "sector_rankings", "result": "failed", "duration_ms": cost_ms}],
-                    [err or "boards empty from all sources"],
+                    chain if chain else [{"provider": "sector_rankings", "result": "not_supported", "duration_ms": cost_ms}],
+                    [err or "boards not available"],
                 )
             board_status = "ok" if top and bottom else "partial"
             return self._build_fundamental_block(
@@ -3080,10 +3107,10 @@ class DataFetcherManager:
             )
 
         return self._build_fundamental_block(
-            "failed",
+            "not_supported",
             {},
-            [{"provider": "sector_rankings", "result": "failed", "duration_ms": cost_ms}],
-            [err or "boards failed"],
+            [{"provider": "sector_rankings", "result": "not_supported", "duration_ms": cost_ms}],
+            [err or "boards not available"],
         )
 
     def _get_sector_rankings_with_meta(

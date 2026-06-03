@@ -57,7 +57,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
     ):
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=news_max_age_days,
             news_strategy_profile=news_strategy_profile,
         )
@@ -112,9 +111,8 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
 
         resp = service.search_stock_news("600519", "贵州茅台", max_results=5)
         titles = [r.title for r in resp.results]
-        self.assertEqual(titles, ["future_1", "fresh"])
-        for item in resp.results:
-            self.assertRegex(item.published_date or "", r"^\d{4}-\d{2}-\d{2}$")
+        # date=None results are now kept (search engine already ranked by freshness)
+        self.assertEqual(titles, ["unknown", "future_1", "fresh"])
 
     def test_search_stock_news_overfetch_before_filter(self) -> None:
         """Provider request size should be increased before filtering."""
@@ -137,7 +135,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
 
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -164,7 +161,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -198,7 +194,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -229,7 +224,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -263,7 +257,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -301,7 +294,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -351,7 +343,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -378,7 +369,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -430,7 +420,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -479,7 +468,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -532,7 +520,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -656,7 +643,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -704,7 +690,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -752,7 +737,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh = datetime.now().date().isoformat()
         service = SearchService(
             bocha_keys=["dummy_key"],
-            searxng_public_instances_enabled=False,
             news_max_age_days=3,
             news_strategy_profile="short",
         )
@@ -840,7 +824,6 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
                 with patch("src.search_service.requests.get", return_value=fake_response) as mock_get:
                     service = SearchService(
                         brave_keys=["dummy_key"],
-                        searxng_public_instances_enabled=False,
                         news_max_age_days=3,
                         news_strategy_profile="short",
                     )
@@ -944,7 +927,8 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         self.assertEqual(intel["latest_news"].results[0].published_date, expected_fresh_date)
         self.assertEqual([item.title for item in intel["market_analysis"].results], ["market_analysis_unknown"])
         self.assertIsNone(intel["market_analysis"].results[0].published_date)
-        self.assertEqual(intel["risk_check"].results, [])
+        self.assertEqual(intel["risk_check"].results[0].title, "risk_unknown")
+        self.assertIsNone(intel["risk_check"].results[0].published_date)
 
     def test_announcements_dimension_included_within_max_searches_5(self) -> None:
         """announcements is now at index 3 so it is processed when max_searches>=4."""

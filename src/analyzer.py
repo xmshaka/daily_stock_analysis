@@ -219,7 +219,16 @@ def check_content_integrity(
         if isinstance(value, (list, tuple, dict)):
             return True
         if isinstance(value, str):
-            return not value.strip()
+            text = value.strip()
+            if not text:
+                return True
+            lower = text.lower()
+            placeholder_prefixes = (
+                "数据缺失", "无法判断", "暂无", "待补充", "未知", "不适用",
+                "to be completed", "data unavailable", "not available",
+            )
+            if any(lower.startswith(p) for p in placeholder_prefixes):
+                return True
         return False
 
     if result.sentiment_score is None:
@@ -244,9 +253,9 @@ def check_content_integrity(
         battle = battle if isinstance(battle, dict) else {}
         sp = battle.get("sniper_points")
         sp = sp if isinstance(sp, dict) else {}
-        stop_loss = sp.get("stop_loss")
-        if _is_invalid_stop_loss(stop_loss):
-            missing.append("dashboard.battle_plan.sniper_points.stop_loss")
+        for field in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
+            if _is_invalid_stop_loss(sp.get(field)):
+                missing.append(f"dashboard.battle_plan.sniper_points.{field}")
     if require_phase_decision:
         phase_decision = dash.get("phase_decision")
         phase_decision = phase_decision if isinstance(phase_decision, dict) else {}
@@ -286,7 +295,16 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
         if isinstance(value, (list, tuple, dict)):
             return True
         if isinstance(value, str):
-            return not value.strip()
+            text = value.strip()
+            if not text:
+                return True
+            lower = text.lower()
+            placeholder_prefixes = (
+                "数据缺失", "无法判断", "暂无", "待补充", "未知", "不适用",
+                "to be completed", "data unavailable", "not available",
+            )
+            if any(lower.startswith(p) for p in placeholder_prefixes):
+                return True
         return False
 
     report_language = normalize_report_language(getattr(result, "report_language", "zh"))
@@ -346,7 +364,7 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
             if _is_invalid_risk_alerts(intelligence.get("risk_alerts")):
                 risk_warning_values = _normalize_risk_warning_values(result.risk_warning)
                 intelligence["risk_alerts"] = risk_warning_values
-        elif field == "dashboard.battle_plan.sniper_points.stop_loss":
+        elif field.startswith("dashboard.battle_plan.sniper_points."):
             if not result.dashboard:
                 result.dashboard = {}
             battle_plan = result.dashboard.get("battle_plan")
@@ -357,8 +375,109 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
             if not isinstance(sniper_points, dict):
                 sniper_points = {}
                 battle_plan["sniper_points"] = sniper_points
-            if _is_invalid_stop_loss(sniper_points.get("stop_loss")):
-                sniper_points["stop_loss"] = placeholder
+            sub_field = field.split(".")[-1]
+            if _is_invalid_stop_loss(sniper_points.get(sub_field)):
+                price = result.current_price
+                # Fallback: try to get current_price from dashboard if not set
+                if not price or price <= 0:
+                    dash = result.dashboard if isinstance(result.dashboard, dict) else {}
+                    dp = dash.get("data_perspective") if isinstance(dash.get("data_perspective"), dict) else {}
+                    pp = dp.get("price_position") if isinstance(dp.get("price_position"), dict) else {}
+                    cp = pp.get("current_price")
+                    if cp is not None:
+                        try:
+                            price = float(cp)
+                        except (TypeError, ValueError):
+                            pass
+                    if not price or price <= 0:
+                        ms = result.market_snapshot
+                        if isinstance(ms, dict):
+                            ms_pp = ms.get("price_position") or ms.get("pricePosition") or {}
+                            cp = ms_pp.get("current_price")
+                            if cp is not None:
+                                try:
+                                    price = float(cp)
+                                except (TypeError, ValueError):
+                                    pass
+                # Try to extract support/resistance from dashboard data_perspective first
+                support = None
+                resistance = None
+                dash = result.dashboard if isinstance(result.dashboard, dict) else {}
+                dp = dash.get("data_perspective") if isinstance(dash.get("data_perspective"), dict) else {}
+                pp = dp.get("price_position") if isinstance(dp.get("price_position"), dict) else {}
+                if isinstance(pp, dict):
+                    for k in ("support_level", "supportLevel"):
+                        v = pp.get(k)
+                        if v is not None:
+                            try:
+                                support = float(v)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                    for k in ("resistance_level", "resistanceLevel"):
+                        v = pp.get(k)
+                        if v is not None:
+                            try:
+                                resistance = float(v)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                # Also try market_snapshot
+                if not support or not resistance:
+                    ms = result.market_snapshot
+                    if isinstance(ms, dict):
+                        ms_pp = ms.get("price_position") or ms.get("pricePosition") or {}
+                        if isinstance(ms_pp, dict):
+                            if not support:
+                                for k in ("support_level", "supportLevel"):
+                                    v = ms_pp.get(k)
+                                    if v is not None:
+                                        try:
+                                            support = float(v)
+                                            break
+                                        except (TypeError, ValueError):
+                                            pass
+                            if not resistance:
+                                for k in ("resistance_level", "resistanceLevel"):
+                                    v = ms_pp.get(k)
+                                    if v is not None:
+                                        try:
+                                            resistance = float(v)
+                                            break
+                                        except (TypeError, ValueError):
+                                            pass
+                is_bearish = getattr(result, "trend_prediction", "") in ("看空", "强烈看空")
+                if not is_bearish:
+                    # Also check data_perspective trend_status for bearish MA alignment
+                    ts = dp.get("trend_status") if isinstance(dp.get("trend_status"), dict) else {}
+                    ma_align = str(ts.get("ma_alignment", "")).lower()
+                    if "空头" in ma_align or "bearish" in ma_align:
+                        is_bearish = True
+                if price and price > 0:
+                    if sub_field == "ideal_buy":
+                        if is_bearish:
+                            ref = support if support and support > 0 else price * 0.95
+                            sniper_points[sub_field] = f"{ref:.2f}元（下方关键支撑观察位）"
+                        else:
+                            sniper_points[sub_field] = f"{price * 0.98:.2f}元（当前价下方约2%，均线附近）"
+                    elif sub_field == "secondary_buy":
+                        if is_bearish:
+                            ref = support * 0.95 if support and support > 0 else price * 0.92
+                            sniper_points[sub_field] = f"{ref:.2f}元（深度回踩观察位）"
+                        else:
+                            sniper_points[sub_field] = f"{price * 0.95:.2f}元（当前价下方约5%，回踩支撑位）"
+                    elif sub_field == "stop_loss":
+                        stop = support * 0.98 if support and support > 0 else price * 0.93
+                        sniper_points[sub_field] = f"{stop:.2f}元（跌破支撑位或当前价下方7%止损）"
+                    elif sub_field == "take_profit":
+                        if is_bearish:
+                            ref = resistance * 0.99 if resistance and resistance > 0 else price * 1.05
+                            sniper_points[sub_field] = f"{ref:.2f}元（反弹压力位，减仓线）"
+                        else:
+                            target = resistance if resistance and resistance > 0 else price * 1.08
+                            sniper_points[sub_field] = f"{target:.2f}元（前高压力位或当前价上方8%）"
+                else:
+                    sniper_points[sub_field] = placeholder
         elif field.startswith("dashboard.phase_decision."):
             if not result.dashboard:
                 result.dashboard = {}
@@ -896,6 +1015,10 @@ def stabilize_decision_with_structure(
     if not result:
         return
 
+    # Always correct trend_prediction vs technicals FIRST, before any early returns
+    # This ensures LLM mislabeling (e.g. '震荡' for clearly bearish stocks) is caught
+    _correct_trend_prediction_vs_technicals(result, normalize_report_language(getattr(result, "report_language", "zh")))
+
     try:
         language = normalize_report_language(getattr(result, "report_language", "zh"))
         dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
@@ -1081,6 +1204,85 @@ def _has_structural_risk_alert(result: "AnalysisResult") -> bool:
         if _is_significant_structural_risk(signal_type):
             return True
     return False
+
+
+def _correct_trend_prediction_vs_technicals(
+    result: "AnalysisResult",
+    language: str,
+) -> None:
+    """Correct trend_prediction when LLM outputs '震荡' but technicals show clear bearish trend.
+
+    This handles the common case where weaker LLMs (e.g. GLM-4-Flash) label a
+    clearly bearish stock as '震荡' because the daily change is small, even when
+    the MA alignment is bearish and the trend score is low.
+    """
+    trend_pred = str(getattr(result, "trend_prediction", "")).strip()
+    if language == "zh" and trend_pred != "震荡":
+        return
+    if language == "en" and trend_pred.lower() != "sideways":
+        return
+
+    dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+    data_perspective = dashboard.get("data_perspective") if isinstance(dashboard, dict) else {}
+    if not isinstance(data_perspective, dict):
+        data_perspective = {}
+
+    # Check for bearish MA alignment from data_perspective
+    # Field name is 'trend_status' (not 'ma_status'), containing 'ma_alignment'
+    trend_status = data_perspective.get("trend_status") if isinstance(data_perspective.get("trend_status"), dict) else {}
+    ma_alignment = str(trend_status.get("ma_alignment", "")).strip().lower()
+    is_bearish_ma = "空头" in ma_alignment or "bearish" in ma_alignment.lower()
+
+    # Check trend_score — from trend_status or data_perspective directly
+    trend_score = None
+    ts_raw = trend_status.get("trend_score") or data_perspective.get("trend_score") or data_perspective.get("trend_strength")
+    if ts_raw is not None:
+        try:
+            trend_score = int(float(ts_raw))
+        except (TypeError, ValueError):
+            pass
+
+    # Also check price_position: if price < MA20 and MA alignment is bearish
+    price_position = data_perspective.get("price_position") if isinstance(data_perspective.get("price_position"), dict) else {}
+    current_price = getattr(result, "current_price", None)
+    ma20 = price_position.get("MA20")
+    price_below_ma20 = False
+    if current_price and ma20:
+        try:
+            price_below_ma20 = float(current_price) < float(ma20)
+        except (TypeError, ValueError):
+            pass
+
+    # Decision: if bearish MA alignment + (low trend_score OR price below MA20), correct
+    should_correct = False
+    if is_bearish_ma:
+        if trend_score is not None and trend_score < 55:
+            should_correct = True
+        elif price_below_ma20:
+            should_correct = True
+        elif trend_score is None and price_below_ma20:
+            should_correct = True
+
+    if not should_correct:
+        return
+
+    # Apply correction
+    if language == "zh":
+        if trend_score is not None and trend_score < 35:
+            result.trend_prediction = "强烈看空"
+        else:
+            result.trend_prediction = "看空"
+    else:
+        if trend_score is not None and trend_score < 35:
+            result.trend_prediction = "Strongly bearish"
+        else:
+            result.trend_prediction = "Bearish"
+
+    logger.info(
+        "[decision_stability] Corrected trend_prediction from '震荡/Sideways' to '%s' "
+        "(bearish_ma=%s, trend_score=%s, price_below_ma20=%s)",
+        result.trend_prediction, is_bearish_ma, trend_score, price_below_ma20,
+    )
 
 
 def _is_significant_structural_risk(value: Any) -> bool:
@@ -1724,10 +1926,10 @@ class GeminiAnalyzer:
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
             },
             "chip_structure": {
-                "profit_ratio": 获利比例,
-                "avg_cost": 平均成本,
-                "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
+                "profit_ratio": 获利比例（如数据缺失则省略此字段）,
+                "avg_cost": 平均成本（如数据缺失则省略此字段）,
+                "concentration": 筹码集中度（如数据缺失则省略此字段）,
+                "chip_health": "健康/一般/警惕（如数据缺失则写数据不足暂不评估）"
             }
         },
 
@@ -1741,10 +1943,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "理想买入点：XX元（在MA5附近或支撑位上方）",
+                "secondary_buy": "次优买入点：XX元（在MA10附近或回踩支撑位）",
+                "stop_loss": "止损位：XX元（跌破MA20或支撑位下方X%）",
+                "take_profit": "目标位：XX元（前高/整数关口/压力位）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -1826,7 +2028,7 @@ class GeminiAnalyzer:
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
+3. **精确狙击点**：必须给出具体价格，不说模糊的话。即使筹码分布数据缺失，也必须基于支撑位、压力位、均线位置、前高前低估算并给出具体价格的狙击点位，绝对禁止写"数据缺失"、"无法判断"、"暂无"等占位文字。
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
 
@@ -1894,10 +2096,10 @@ class GeminiAnalyzer:
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
             },
             "chip_structure": {
-                "profit_ratio": 获利比例,
-                "avg_cost": 平均成本,
-                "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
+                "profit_ratio": 获利比例（如数据缺失则省略此字段）,
+                "avg_cost": 平均成本（如数据缺失则省略此字段）,
+                "concentration": 筹码集中度（如数据缺失则省略此字段）,
+                "chip_health": "健康/一般/警惕（如数据缺失则写数据不足暂不评估）"
             }
         },
 
@@ -1993,7 +2195,7 @@ class GeminiAnalyzer:
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
+3. **精确狙击点**：必须给出具体价格，不说模糊的话。即使筹码分布数据缺失，也必须基于支撑位、压力位、均线位置、前高前低估算并给出具体价格的狙击点位，绝对禁止写"数据缺失"、"无法判断"、"暂无"等占位文字。
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
 

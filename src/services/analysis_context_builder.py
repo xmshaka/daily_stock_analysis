@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
+from src.core.trading_calendar import infer_market_phase, MarketPhase
 from src.schemas.analysis_context_pack import (
     AnalysisContextBlock,
     AnalysisContextItem,
@@ -254,18 +255,21 @@ def _build_technical_block(
             [],
         )
 
-    explicit_intraday_overlay = _has_explicit_intraday_overlay(
-        artifacts.enhanced_context
-    )
-    has_realtime_overlay = explicit_intraday_overlay or _has_realtime_overlay(
-        artifacts.enhanced_context
-    )
-    warnings = [_REALTIME_OVERLAY_WARNING] if has_realtime_overlay else []
-    block_status = (
-        ContextFieldStatus.PARTIAL
-        if has_realtime_overlay
-        else ContextFieldStatus.AVAILABLE
-    )
+    has_realtime_overlay = _has_realtime_overlay(artifacts.enhanced_context)
+
+    # Issue #234: 盘中/盘后实时覆盖都是正常行为——
+    # 盘中是预期 overlay，盘后实时数据已经收敛到收盘价位。
+    # 只有盘前（PREMARKET）和非交易日（NON_TRADING）出现 realtime: 覆盖时才告警，
+    # 因为此时实时数据可能是昨日收盘，覆盖到今日不存在的 bars 上会导致数据错乱。
+    phase = infer_market_phase(artifacts.market)
+    should_warn = phase in {MarketPhase.PREMARKET, MarketPhase.NON_TRADING}
+
+    if has_realtime_overlay and should_warn:
+        warnings = [_REALTIME_OVERLAY_WARNING]
+        block_status = ContextFieldStatus.PARTIAL
+    else:
+        warnings = []
+        block_status = ContextFieldStatus.AVAILABLE
     items: Dict[str, AnalysisContextItem] = {
         "trend_result": AnalysisContextItem(
             status=ContextFieldStatus.AVAILABLE,
@@ -721,7 +725,17 @@ def _fundamental_payload_missing_reason(
 def _source_from_chain(source_chain: Any) -> Optional[str]:
     if not isinstance(source_chain, list) or not source_chain:
         return None
-    first = source_chain[0]
-    if isinstance(first, dict):
-        return _source_text(first.get("provider") or first.get("source"))
-    return _source_text(first)
+    for item in source_chain:
+        if isinstance(item, dict):
+            # 跳过 result 为 not_supported 的来源，这些来源没有提供有效数据
+            result = str(item.get("result") or "").lower()
+            if result == "not_supported":
+                continue
+            src = _source_text(item.get("provider") or item.get("source"))
+            if src:
+                return src
+        else:
+            src = _source_text(item)
+            if src:
+                return src
+    return None
