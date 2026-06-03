@@ -692,3 +692,65 @@ get_capital_flow_tool = ToolDefinition(
 
 
 ALL_DATA_TOOLS.append(get_capital_flow_tool)
+
+
+# ── Stock code lookup tool ──────────────────────────────────────────────
+
+def _handle_search_stock_code(stock_name: str) -> dict:
+    """Search for A-share stock code by name. Returns matching stocks with code, name, and market."""
+    try:
+        from data_provider.base import DataProvider
+        dp = DataProvider()
+        results = dp.search_stock(stock_name)
+        if results:
+            matches = []
+            for r in results[:10]:
+                matches.append({
+                    "code": r.get("code", ""),
+                    "name": r.get("name", ""),
+                    "market": r.get("market", ""),
+                })
+            return {"found": True, "matches": matches, "count": len(matches)}
+        return {"found": False, "matches": [], "count": 0, "message": f"No stock found for name: {stock_name}"}
+    except Exception as e:
+        # Fallback: try tushare
+        try:
+            import tushare as ts
+            pro = ts.pro_api()
+            df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name')
+            matches_df = df[df['name'].str.contains(stock_name, na=False)]
+            if not matches_df.empty:
+                matches = []
+                for _, row in matches_df.head(10).iterrows():
+                    matches.append({
+                        "code": row.get("symbol", ""),
+                        "name": row.get("name", ""),
+                        "market": row.get("ts_code", ""),
+                    })
+                return {"found": True, "matches": matches, "count": len(matches)}
+            return {"found": False, "matches": [], "count": 0}
+        except Exception as e2:
+            return {"found": False, "error": str(e), "fallback_error": str(e2)}
+
+
+search_stock_code_tool = ToolDefinition(
+    name="search_stock_code",
+    description=(
+        "Search for the correct A-share stock code by stock name. "
+        "MUST call this tool when the user provides a stock name but NOT a stock code. "
+        "Returns matching stocks with their codes. "
+        "Example: stock_name='四方股份' returns code='601126'. "
+        "IMPORTANT: Never guess stock codes — always use this tool to verify."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Stock name in Chinese, e.g., '四方股份', '贵州茅台'",
+        ),
+    ],
+    handler=_handle_search_stock_code,
+    category="data",
+)
+
+ALL_DATA_TOOLS.append(search_stock_code_tool)
