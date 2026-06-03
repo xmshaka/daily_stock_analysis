@@ -3146,7 +3146,9 @@ class SearchService:
             published = self._normalize_news_publish_date(item.published_date)
             # Fallback: try extracting date from URL if published_date is None
             if published is None and item.url:
-                published = AnySearchProvider._extract_date_from_url(item.url)
+                url_date_str = AnySearchProvider._extract_date_from_url(item.url)
+                if url_date_str:
+                    published = self._normalize_news_publish_date(url_date_str)
             if published is None:
                 dropped_unknown += 1
                 # When freshness filtering is active, the search engine already ranked
